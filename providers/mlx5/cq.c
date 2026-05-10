@@ -138,17 +138,18 @@ static void *get_cqe(struct mlx5_cq *cq, int n)
 
 static void *get_sw_cqe(struct mlx5_cq *cq, int n)
 {
-	void *cqe = get_cqe(cq, n & cq->verbs_cq.cq.cqe);
-	struct mlx5_cqe64 *cqe64;
+    void *cqe = get_cqe(cq, n & cq->verbs_cq.cq.cqe);
+    struct mlx5_cqe64 *cqe64;
+    static int dbg = 0;
 
-	cqe64 = (cq->cqe_sz == 64) ? cqe : cqe + 64;
+    cqe64 = (cq->cqe_sz == 64) ? cqe : cqe + 64;
 
-	if (likely(mlx5dv_get_cqe_opcode(cqe64) != MLX5_CQE_INVALID) &&
-	    !((cqe64->op_own & MLX5_CQE_OWNER_MASK) ^ !!(n & (cq->verbs_cq.cq.cqe + 1)))) {
-		return cqe;
-	} else {
-		return NULL;
-	}
+    if (likely(mlx5dv_get_cqe_opcode(cqe64) != MLX5_CQE_INVALID) &&
+        !((cqe64->op_own & MLX5_CQE_OWNER_MASK) ^ !!(n & (cq->verbs_cq.cq.cqe + 1)))) {
+        return cqe;
+    } else {
+        return NULL;
+    }
 }
 
 static void *next_cqe_sw(struct mlx5_cq *cq)

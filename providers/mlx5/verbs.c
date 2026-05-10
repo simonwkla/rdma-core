@@ -31,8 +31,10 @@
  * SOFTWARE.
  */
 
+#include "mlx5dv.h"
 #include <config.h>
 
+#include <stddef.h>
 #include <stdlib.h>
 #include <stdio.h>
 #include <stdatomic.h>
@@ -1016,6 +1018,12 @@ static struct ibv_cq_ex *create_cq(struct ibv_context *context,
 	struct mlx5_context *mctx = to_mctx(context);
 	FILE *fp = to_mctx(context)->dbg_fp;
 
+  fprintf(stderr, "[coh] create_cq entered, MLX5_COH_CQ=%s\n",
+            getenv("MLX5_COH_CQ") ?: "(unset)");
+  fflush(stderr);
+
+  bool coh = getenv("MLX5_COH_CQ") != NULL;
+
 	if (!cq_attr->cqe) {
 		mlx5_dbg(fp, MLX5_DBG_CQ, "CQE invalid\n");
 		errno = EINVAL;
@@ -1100,7 +1108,7 @@ static struct ibv_cq_ex *create_cq(struct ibv_context *context,
 		goto err_spl;
 	}
 
-	if (mlx5_alloc_cq_buf(to_mctx(context), cq, &cq->buf_a, ncqe, cqe_sz)) {
+	if (!coh && mlx5_alloc_cq_buf(to_mctx(context), cq, &cq->buf_a, ncqe, cqe_sz)) {
 		mlx5_dbg(fp, MLX5_DBG_CQ, "\n");
 		goto err_spl;
 	}
@@ -1118,9 +1126,13 @@ static struct ibv_cq_ex *create_cq(struct ibv_context *context,
 	cq->cqe_sz			= cqe_sz;
 	cq->flags			= cq_alloc_flags;
 
-	cmd_drv->buf_addr = (uintptr_t) cq->buf_a.buf;
+	cmd_drv->buf_addr = coh ? 0 : (uintptr_t) cq->buf_a.buf;
 	cmd_drv->db_addr  = (uintptr_t) cq->dbrec;
 	cmd_drv->cqe_size = cqe_sz;
+
+  if(coh) {
+    cmd_drv->flags |= MLX5_IB_CREATE_CQ_FLAGS_COH_BUF;
+  }
 
 	if (mlx5cq_attr) {
 		if (mlx5cq_attr->comp_mask & MLX5DV_CQ_INIT_ATTR_MASK_COMPRESSED_CQE) {
@@ -1191,6 +1203,63 @@ static struct ibv_cq_ex *create_cq(struct ibv_context *context,
 		goto err_db;
 	}
 
+  if(coh){
+    void *map;
+    void *dbrec_map;
+    int i;
+
+    if(!resp_drv->cq_buf_size || resp_drv->cq_buf_size < (size_t)ncqe * (size_t)cqe_sz) {
+      errno = EINVAL;
+      goto err_cq_created;
+    }
+
+    map = mmap(
+      NULL,
+      resp_drv->cq_buf_size,
+      PROT_READ | PROT_WRITE,
+      MAP_SHARED,
+      context->cmd_fd,
+      resp_drv->cq_buf_offset
+    );
+    if(map == MAP_FAILED){
+      goto err_cq_created;
+    }
+
+    cq->buf_a.buf = map;
+    cq->buf_a.length = resp_drv->cq_buf_size;
+    cq->coh_cq_buf = true;
+    cq->coh_mmap_len = resp_drv->cq_buf_size;
+
+    for (i = 0; i < ncqe; ++i) {
+      struct mlx5_cqe64 *cqe;
+
+      cqe = cq->buf_a.buf + i * cqe_sz;
+      cqe += cqe_sz == 128 ? 1 : 0;
+      cqe->op_own = MLX5_CQE_INVALID << 4;
+    }
+
+    if(resp_drv->dbrec_size) {
+      dbrec_map = mmap(
+        NULL,
+        resp_drv->dbrec_size,
+        PROT_READ | PROT_WRITE,
+        MAP_SHARED,
+        context->cmd_fd,
+        resp_drv->dbrec_offset
+      );
+      if(dbrec_map == MAP_FAILED){
+        goto err_cq_created;
+      }
+      mlx5_free_db(to_mctx(context), cq->dbrec, cq->parent_domain, cq->custom_db);
+      cq->dbrec = (__be32 *)dbrec_map;
+      cq->custom_db = false;
+      cq->coh_dbrec_buf = dbrec_map;
+      cq->coh_dbrec_mmap_len = resp_drv->dbrec_size;
+      cq->dbrec[MLX5_CQ_SET_CI] = 0;
+      cq->dbrec[MLX5_CQ_ARM_DB] = 0;
+    }
+  }
+
 	if (cq->parent_domain)
 		atomic_fetch_add(&to_mparent_domain(cq->parent_domain)->mpd.refcount, 1);
 	cq->active_buf = &cq->buf_a;
@@ -1202,11 +1271,28 @@ static struct ibv_cq_ex *create_cq(struct ibv_context *context,
 
 	return &cq->verbs_cq.cq_ex;
 
+err_cq_created:
+  (void)ibv_cmd_destroy_cq(ibv_cq_ex_to_cq(&cq->verbs_cq.cq_ex));
+  if(cq->coh_dbrec_buf) {
+    munmap(cq->coh_dbrec_buf, cq->coh_dbrec_mmap_len);
+  } else {
+    mlx5_free_db(to_mctx(context), cq->dbrec, cq->parent_domain, cq->custom_db);
+  }
+	mlx5_spinlock_destroy(&cq->lock);
+  free(cq);
+  return NULL;
+
 err_db:
-	mlx5_free_db(to_mctx(context), cq->dbrec, cq->parent_domain, cq->custom_db);
+  if(cq->coh_dbrec_buf) {
+    munmap(cq->coh_dbrec_buf, cq->coh_dbrec_mmap_len);
+  } else {
+    mlx5_free_db(to_mctx(context), cq->dbrec, cq->parent_domain, cq->custom_db);
+  }
 
 err_buf:
-	mlx5_free_cq_buf(to_mctx(context), &cq->buf_a);
+  if(!coh){
+    mlx5_free_cq_buf(to_mctx(context), &cq->buf_a);
+  }
 
 err_spl:
 	mlx5_spinlock_destroy(&cq->lock);
@@ -1278,6 +1364,11 @@ int mlx5_resize_cq(struct ibv_cq *ibcq, int cqe)
 	struct mlx5_context *mctx = to_mctx(ibcq->context);
 	int err;
 
+  if(cq->coh_cq_buf) {
+    errno = EOPNOTSUPP;
+    return EOPNOTSUPP;
+  }
+
 	if (cqe < 0) {
 		errno = EINVAL;
 		return errno;
@@ -1347,9 +1438,24 @@ int mlx5_destroy_cq(struct ibv_cq *cq)
 	if (ret)
 		return ret;
 
-	mlx5_free_db(to_mctx(cq->context), mcq->dbrec, mcq->parent_domain,
-		     mcq->custom_db);
-	mlx5_free_cq_buf(to_mctx(cq->context), mcq->active_buf);
+  if(mcq->coh_dbrec_buf) {
+    munmap(mcq->coh_dbrec_buf, mcq->coh_dbrec_mmap_len);
+    mcq->coh_dbrec_buf = NULL;
+    mcq->coh_dbrec_mmap_len = 0;
+  } else {
+    mlx5_free_db(to_mctx(cq->context), mcq->dbrec, mcq->parent_domain,
+                 mcq->custom_db);
+  }
+
+  if(mcq->coh_cq_buf){
+    munmap(mcq->buf_a.buf, mcq->coh_mmap_len);
+    memset(&mcq->buf_a, 0, sizeof(mcq->buf_a));
+    mcq->coh_mmap_len = 0;
+    mcq->coh_cq_buf = false;
+  } else {
+    mlx5_free_cq_buf(to_mctx(cq->context), mcq->active_buf);
+  }
+
 	if (mcq->parent_domain)
 		atomic_fetch_sub(&to_mparent_domain(mcq->parent_domain)->mpd.refcount, 1);
 	free(mcq);
@@ -2089,7 +2195,14 @@ ex_wrid:
 
 static void mlx5_free_qp_buf(struct mlx5_context *ctx, struct mlx5_qp *qp)
 {
-	mlx5_free_actual_buf(ctx, &qp->buf);
+	if (qp->coh_buf_buf) {
+		munmap(qp->coh_buf_buf, qp->coh_buf_mmap_len);
+		qp->coh_buf_buf = NULL;
+		qp->coh_buf_mmap_len = 0;
+		qp->buf.buf = NULL;
+	} else {
+		mlx5_free_actual_buf(ctx, &qp->buf);
+	}
 
 	if (qp->sq_buf.buf)
 		mlx5_free_actual_buf(ctx, &qp->sq_buf);
@@ -2680,6 +2793,10 @@ static struct ibv_qp *create_qp(struct ibv_context *context,
 			mlx5_spinlock_init_pd(&qp->rq.lock, attr->pd))
 		goto err_free_qp_buf;
 
+	bool coh_dbrec = getenv("MLX5_COH_QP") != NULL;
+	fprintf(stderr, "[coh] create_qp entered, MLX5_COH_QP=%s\n",
+		coh_dbrec ? "1" : "(unset)");
+
 	qp->db = mlx5_alloc_dbrec(ctx, attr->pd, &qp->custom_db);
 	if (!qp->db) {
 		mlx5_dbg(fp, MLX5_DBG_QP, "\n");
@@ -2696,6 +2813,11 @@ static struct ibv_qp *create_qp(struct ibv_context *context,
 			   qp->flags & MLX5_QP_FLAGS_USE_UNDERLAY) ?
 			  (uintptr_t) qp->sq_buf.buf : 0;
 	cmd.db_addr  = (uintptr_t) qp->db;
+	if (coh_dbrec) {
+		cmd.flags |= MLX5_QP_FLAG_COH_DBREC;
+		cmd.flags |= MLX5_QP_FLAG_COH_BUF;
+		cmd.buf_addr = 0;
+	}
 	cmd.sq_wqe_count = qp->sq.wqe_cnt;
 	cmd.rq_wqe_count = qp->rq.wqe_cnt;
 	cmd.rq_wqe_shift = qp->rq.wqe_shift;
@@ -2750,6 +2872,41 @@ static struct ibv_qp *create_qp(struct ibv_context *context,
 
 	resp_drv = attr->comp_mask & MLX5_CREATE_QP_EX2_COMP_MASK ?
 			&resp_ex.drv_payload : &resp.drv_payload;
+
+	if (coh_dbrec && resp_drv->dbrec_size) {
+		void *dbrec_map = mmap(NULL, resp_drv->dbrec_size,
+				       PROT_READ | PROT_WRITE, MAP_SHARED,
+				       context->cmd_fd, resp_drv->dbrec_offset);
+		if (dbrec_map == MAP_FAILED)
+			goto err_destroy;
+		mlx5_free_db(ctx, qp->db, attr->pd, qp->custom_db);
+		qp->db = (__be32 *)dbrec_map;
+		qp->custom_db = false;
+		qp->coh_dbrec_buf = dbrec_map;
+		qp->coh_dbrec_mmap_len = resp_drv->dbrec_size;
+		qp->db[MLX5_RCV_DBR] = 0;
+		qp->db[MLX5_SND_DBR] = 0;
+	}
+
+	if (coh_dbrec && resp_drv->buf_size) {
+		void *buf_map = mmap(NULL, resp_drv->buf_size,
+				     PROT_READ | PROT_WRITE, MAP_SHARED,
+				     context->cmd_fd, resp_drv->buf_offset);
+		if (buf_map == MAP_FAILED)
+			goto err_destroy;
+		mlx5_free_actual_buf(ctx, &qp->buf);
+		qp->buf.buf = buf_map;
+		qp->buf.length = resp_drv->buf_size;
+		qp->coh_buf_buf = buf_map;
+		qp->coh_buf_mmap_len = resp_drv->buf_size;
+		if (attr->qp_type != IBV_QPT_RAW_PACKET &&
+		    !(qp->flags & MLX5_QP_FLAGS_USE_UNDERLAY)) {
+			qp->sq_start = qp->buf.buf + qp->sq.offset;
+			qp->sq.qend = qp->buf.buf + qp->sq.offset +
+				      (qp->sq.wqe_cnt << qp->sq.wqe_shift);
+		}
+	}
+
 	if (!ctx->cqe_version) {
 		if (qp->sq.wqe_cnt || qp->rq.wqe_cnt) {
 			ret = mlx5_store_qp(ctx, ibqp->qp_num, qp);
@@ -2815,7 +2972,12 @@ err_free_uidx:
 		mlx5_clear_uidx(ctx, usr_idx);
 
 err_rq_db:
-	mlx5_free_db(to_mctx(context), qp->db, attr->pd, qp->custom_db);
+	if (qp->coh_dbrec_buf) {
+		munmap(qp->coh_dbrec_buf, qp->coh_dbrec_mmap_len);
+		qp->coh_dbrec_buf = NULL;
+	} else {
+		mlx5_free_db(to_mctx(context), qp->db, attr->pd, qp->custom_db);
+	}
 
 err_free_qp_buf:
 	mlx5_free_qp_buf(ctx, qp);
@@ -2938,7 +3100,13 @@ int mlx5_destroy_qp(struct ibv_qp *ibqp)
 		mlx5_clear_uidx(ctx, qp->rsc.rsn);
 
 	if (qp->dc_type != MLX5DV_DCTYPE_DCT) {
-		mlx5_free_db(ctx, qp->db, ibqp->pd, qp->custom_db);
+		if (qp->coh_dbrec_buf) {
+			munmap(qp->coh_dbrec_buf, qp->coh_dbrec_mmap_len);
+			qp->coh_dbrec_buf = NULL;
+			qp->coh_dbrec_mmap_len = 0;
+		} else {
+			mlx5_free_db(ctx, qp->db, ibqp->pd, qp->custom_db);
+		}
 		mlx5_free_qp_buf(ctx, qp);
 	}
 free:
