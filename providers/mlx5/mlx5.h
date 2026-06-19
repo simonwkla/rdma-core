@@ -519,6 +519,11 @@ struct mlx5_cq {
 	int				cached_opcode;
 	struct mlx5dv_clock_info	last_clock_info;
 	struct ibv_pd			*parent_domain;
+  // coh
+  bool coh_cq_buf;
+  size_t coh_mmap_len;
+  void *coh_dbrec_buf;
+  size_t coh_dbrec_mmap_len;
 };
 
 struct mlx5_tag_entry {
@@ -723,6 +728,11 @@ struct mlx5_qp {
 	uint32_t			get_ece;
 
 	uint8_t				need_mmo_enable:1;
+
+	void				*coh_dbrec_buf;
+	size_t				coh_dbrec_mmap_len;
+	void				*coh_buf_buf;
+	size_t				coh_buf_mmap_len;
 };
 
 struct mlx5_ah {
