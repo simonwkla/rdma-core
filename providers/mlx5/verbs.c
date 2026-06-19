@@ -1018,10 +1018,6 @@ static struct ibv_cq_ex *create_cq(struct ibv_context *context,
 	struct mlx5_context *mctx = to_mctx(context);
 	FILE *fp = to_mctx(context)->dbg_fp;
 
-  fprintf(stderr, "[coh] create_cq entered, MLX5_COH_CQ=%s\n",
-            getenv("MLX5_COH_CQ") ?: "(unset)");
-  fflush(stderr);
-
   bool coh = getenv("MLX5_COH_CQ") != NULL;
 
 	if (!cq_attr->cqe) {
@@ -2794,8 +2790,6 @@ static struct ibv_qp *create_qp(struct ibv_context *context,
 		goto err_free_qp_buf;
 
 	bool coh_dbrec = getenv("MLX5_COH_QP") != NULL;
-	fprintf(stderr, "[coh] create_qp entered, MLX5_COH_QP=%s\n",
-		coh_dbrec ? "1" : "(unset)");
 
 	qp->db = mlx5_alloc_dbrec(ctx, attr->pd, &qp->custom_db);
 	if (!qp->db) {
